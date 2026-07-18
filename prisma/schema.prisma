@@ -1,0 +1,290 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  CUSTOMER
+  SUPPORT
+  OPS
+  ADMIN
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+enum IdempotencyStatus {
+  IN_PROGRESS
+  COMPLETED
+  CONFLICT
+}
+
+enum ProviderPaymentStatus {
+  RECEIVED
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+enum ProviderDecision {
+  SUCCEED
+  FAIL
+  PARTIAL_SUCCESS
+  NETWORK_UNKNOWN
+}
+
+enum PaymentEventType {
+  PAYMENT_CREATED
+  PROVIDER_ACCEPTED
+  WEBHOOK_RECEIVED
+  STATUS_CHANGED
+  REFUND_REQUESTED
+  REFUND_SUCCEEDED
+  REFUND_FAILED
+  RECONCILIATION_FLAGGED
+  RECONCILIATION_CLEARED
+}
+
+enum WebhookDeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+}
+
+enum WebhookProcessingStatus {
+  RECEIVED
+  PROCESSED
+  REJECTED
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum ReconciliationRunStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum ReconciliationIssueStatus {
+  OPEN
+  RESOLVED
+  IGNORED
+}
+
+enum ReconciliationIssueType {
+  STATUS_MISMATCH
+  MISSING_LOCAL_PAYMENT
+  MISSING_PROVIDER_PAYMENT
+  MISSING_WEBHOOK_DELIVERY
+}
+
+model User {
+  id               String    @id @default(cuid())
+  email            String    @unique
+  name             String
+  role             UserRole
+  passwordHash     String
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  sessions         Session[]
+  ownedPayments    Payment[] @relation("PaymentOwner")
+  createdPayments  Payment[] @relation("PaymentCreator")
+  createdRefunds   Refund[]
+  startedReconRuns ReconciliationRun[]
+  paymentEvents    PaymentEvent[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model IdempotencyRecord {
+  id                 String             @id @default(cuid())
+  key                String
+  route              String
+  requestHash        String
+  status             IdempotencyStatus
+  responseStatusCode Int?
+  responseBody       Json?
+  resourceType       String?
+  resourceId         String?
+  lockedAt           DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  @@unique([route, key])
+}
+
+model Payment {
+  id                    String                 @id @default(cuid())
+  reference             String                 @unique
+  amountMinor           Int
+  currency              String
+  status                PaymentStatus
+  failureCode           String?
+  failureMessage        String?
+  providerPaymentId     String?                @unique
+  lastKnownProvider     ProviderPaymentStatus?
+  metadata              Json?
+  ownerUserId           String
+  createdByUserId       String
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+  owner                 User                   @relation("PaymentOwner", fields: [ownerUserId], references: [id])
+  createdBy             User                   @relation("PaymentCreator", fields: [createdByUserId], references: [id])
+  attempts              PaymentAttempt[]
+  events                PaymentEvent[]
+  refunds               Refund[]
+  providerPayment       ProviderPayment?
+  webhookDeliveries     WebhookDelivery[]
+  processedWebhookEvents WebhookEvent[]
+  reconciliationIssues  ReconciliationIssue[]
+
+  @@index([ownerUserId, createdAt])
+  @@index([status, createdAt])
+}
+
+model PaymentAttempt {
+  id                String           @id @default(cuid())
+  paymentId         String
+  providerRequestId String           @unique
+  decision          ProviderDecision
+  requestPayload    Json
+  responsePayload   Json?
+  createdAt         DateTime         @default(now())
+  payment           Payment          @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId])
+}
+
+model ProviderPayment {
+  id                String                @id @default(cuid())
+  paymentId         String                @unique
+  externalPaymentId String                @unique
+  amountMinor       Int
+  currency          String
+  status            ProviderPaymentStatus
+  decision          ProviderDecision
+  latestPayload     Json?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+  payment           Payment               @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([status, updatedAt])
+}
+
+model WebhookDelivery {
+  id                String                @id @default(cuid())
+  providerEventId   String                @unique
+  paymentId         String
+  providerPaymentId String
+  eventType         String
+  status            WebhookDeliveryStatus
+  payload           Json
+  attempts          Int                   @default(0)
+  nextAttemptAt     DateTime?
+  lastError         String?
+  deliveredAt       DateTime?
+  createdAt         DateTime              @default(now())
+  payment           Payment               @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt])
+}
+
+model WebhookEvent {
+  id                String                  @id @default(cuid())
+  providerEventId   String                  @unique
+  paymentId         String?
+  providerPaymentId String
+  eventType         String
+  processingStatus  WebhookProcessingStatus
+  payload           Json
+  processingError   String?
+  receivedAt        DateTime                @default(now())
+  processedAt       DateTime?
+  payment           Payment?                @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+
+  @@index([processingStatus, receivedAt])
+}
+
+model PaymentEvent {
+  id          String           @id @default(cuid())
+  paymentId   String
+  actorUserId String?
+  actorLabel  String
+  type        PaymentEventType
+  payload     Json?
+  createdAt   DateTime         @default(now())
+  payment     Payment          @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  actorUser   User?            @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([paymentId, createdAt])
+}
+
+model Refund {
+  id              String       @id @default(cuid())
+  paymentId       String
+  amountMinor     Int
+  reason          String
+  status          RefundStatus
+  providerRefundId String?     @unique
+  createdByUserId String
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  payment         Payment      @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  createdBy       User         @relation(fields: [createdByUserId], references: [id])
+
+  @@index([paymentId])
+}
+
+model ReconciliationRun {
+  id              String                 @id @default(cuid())
+  status          ReconciliationRunStatus
+  summary         Json?
+  errorMessage    String?
+  startedByUserId String?
+  startedAt       DateTime               @default(now())
+  completedAt     DateTime?
+  startedBy       User?                  @relation(fields: [startedByUserId], references: [id], onDelete: SetNull)
+  issues          ReconciliationIssue[]
+
+  @@index([startedAt])
+}
+
+model ReconciliationIssue {
+  id                String                    @id @default(cuid())
+  runId             String
+  paymentId         String?
+  providerPaymentId String?
+  type              ReconciliationIssueType
+  status            ReconciliationIssueStatus
+  localStatus       String?
+  providerStatus    String?
+  details           Json?
+  createdAt         DateTime                  @default(now())
+  resolvedAt        DateTime?
+  run               ReconciliationRun         @relation(fields: [runId], references: [id], onDelete: Cascade)
+  payment           Payment?                  @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+
+  @@index([runId, status])
+}
