@@ -109,4 +109,42 @@ Reviewer should verify:
 - `src/services/reconciliationService.ts` around the `missingWebhookDelivery` branch.
 - `src/components/admin/ReconciliationPanel.tsx` to confirm the UI exposes both delivery and reconciliation actions instead of only reports.
 - `docs/architecture/request-lifecycle.md` to verify the documented flow still matches the real call chain.
-One thing a junior reviewer would approve without questioning that a stronger reviewer would flag: a reconciliation report that identifies issues but provides no persisted issue history or operator workflow.
+One thing a junior reviewer would approve without questioning that a stronger reviewer would flag: a reconciliation report that identifies issues but provides no persisted issue history or operator workflow. (Post-review note: the history is persisted, but the workflow is not — no code path sets an issue to `RESOLVED` or `IGNORED`, so the "operator workflow" this slice warns about is still missing.)
+
+## Stage 7 — Post-hoc code review (2026-10)
+
+This stage was not part of the original build. It records what a line-by-line review of the finished code found when each slice's "reviewer should verify" list was actually checked. It is written in the same format as the slices so it can be read as "what the reviewer would have said".
+
+### Slice 1 review — schema and persistence
+- Verified: `@@unique([route, key])` (`prisma/schema.prisma:135`) is present and is what makes concurrent creates safe. `ProviderPayment.paymentId` is `@unique` (`:182`), so the mirror is genuinely 1:1.
+- Missed: the unique scope does not include the caller, so keys are global (auth Finding A4). `lockedAt`, `CONFLICT`, `nextAttemptAt`, `REFUND_FAILED`, `RECONCILIATION_CLEARED`, `RESOLVED`/`IGNORED` are modelled but never used (full list in `docs/architecture/domain-model.md`).
+- Missed: there is no `prisma/migrations/` directory in the repo; the schema can only be applied with `prisma migrate dev` (the `prisma:migrate` script), which generates migrations locally.
+
+### Slice 2 review — auth and RBAC
+- Verified: permission checks do happen before handler logic (`src/lib/auth/guards.ts:32`), and expired sessions are rejected server-side (`src/lib/auth/session.ts:32`).
+- Missed: because the check happens *outside* the handler, its errors bypass `jsonError()` — clients get a 500, not the 401/403 the docs promised (Finding A1).
+- Missed: `guards.ts:10` imports `RouteError` from `../api/route-helpers`, which does not export it (Finding A2). A type-check in CI would have caught this; the repo has no `typecheck` script.
+- Missed: `LoginForm.tsx:24` routes every role to `/admin/payments`, including `CUSTOMER`, who is not allowed there.
+
+### Slice 3 review — idempotent create
+- Verified: a key reused with a different payload is rejected with `409` on both the fast path (`paymentService.ts:71`) and the race path (`:175`), as the slice asked.
+- Missed: the browser client generates a fresh key per call (`src/hooks/usePaymentActions.ts:32`), so the UI never exercises replay.
+- Missed: `NETWORK_UNKNOWN` behaves exactly like `SUCCEED` apart from a string in `PaymentAttempt.responsePayload` (`providerSimulatorService.ts:84`); the "ambiguous network" scenario is labelled, not modelled.
+
+### Slice 4 review — webhooks, refunds, state machine
+- Verified: `assertRefundAllowed()` checks against the *remaining* amount (`refundService.ts:32-34`), so sequential partial refunds cannot exceed the original — the exact bug this slice flagged.
+- Missed: the same check is not concurrency-safe; two simultaneous refunds both pass (Finding L2, reproduced in scratch checks C9/C10).
+- Missed: the rejected-webhook record is written through the transaction that is then rolled back (Finding L3).
+- Missed: the provider webhook route is unauthenticated and unvalidated — acknowledged by the SENIOR NOTE at `src/app/api/webhooks/provider/route.ts:8`, but the docs elsewhere called the path "replay-safe" without qualification.
+
+### Slice 5 review — reconciliation and UI
+- Verified: the `missingWebhookDelivery` branch (`reconciliationService.ts:61-64`) correctly distinguishes "no delivery was ever queued" from "delivery queued but not yet processed".
+- Missed: two of the four issue types cannot be produced by the app's own writes (`domain-model.md`, "Which rows does each simulation mode produce?").
+- Missed: issues are never closed, so each run re-flags the same payment; the issues list is capped at 50 rows (`reconciliationRepository.ts:79`), so old runs eventually push current ones out of view only by recency, not by status.
+
+### What I would change first, in order
+1. Move `guards.ts:32` inside a `try` that returns `jsonError()`, and fix the `guards.ts:10` import. Two small edits; they make every auth failure observable and correct.
+2. Make refunds safe: lock the payment row inside the transaction and recompute the refunded sum there. Add an idempotency key to the refund route.
+3. Record webhook rejections outside the failed transaction; validate the payload with a zod schema; add a shared-secret HMAC check on the webhook route.
+4. Retry `FAILED` deliveries whose `nextAttemptAt` has passed; add a claim step so two relays cannot process the same row.
+5. Generate the idempotency key once per form intent in the client.
